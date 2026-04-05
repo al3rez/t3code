@@ -10,7 +10,7 @@ import path from "node:path";
 
 import type { ThreadId } from "@t3tools/contracts";
 import { RotatingFileSink } from "@t3tools/shared/logging";
-import { Effect, Exit, Logger, Scope } from "effect";
+import { Effect, Exit, Logger, Scope, Semaphore } from "effect";
 
 import { toSafeThreadAttachmentSegment } from "../../attachmentStore.ts";
 
@@ -195,33 +195,35 @@ export const makeEventNdjsonLogger = Effect.fn("makeEventNdjsonLogger")(function
 
   const threadWriters = new Map<string, ThreadWriter>();
   const failedSegments = new Set<string>();
+  const writerMutex = yield* Semaphore.make(1);
 
-  const resolveThreadWriter = Effect.fn("resolveThreadWriter")(function* (
-    threadSegment: string,
-  ): Effect.fn.Return<ThreadWriter | undefined> {
-    if (failedSegments.has(threadSegment)) {
-      return undefined;
-    }
-    const existing = threadWriters.get(threadSegment);
-    if (existing) {
-      return existing;
-    }
+  const resolveThreadWriter = (threadSegment: string) =>
+    writerMutex.withPermits(1)(
+      Effect.gen(function* () {
+        if (failedSegments.has(threadSegment)) {
+          return undefined;
+        }
+        const existing = threadWriters.get(threadSegment);
+        if (existing) {
+          return existing;
+        }
 
-    const writer = yield* makeThreadWriter({
-      filePath: path.join(path.dirname(filePath), `${threadSegment}.log`),
-      maxBytes,
-      maxFiles,
-      batchWindowMs,
-      streamLabel,
-    });
-    if (!writer) {
-      failedSegments.add(threadSegment);
-      return undefined;
-    }
+        const writer = yield* makeThreadWriter({
+          filePath: path.join(path.dirname(filePath), `${threadSegment}.log`),
+          maxBytes,
+          maxFiles,
+          batchWindowMs,
+          streamLabel,
+        });
+        if (!writer) {
+          failedSegments.add(threadSegment);
+          return undefined;
+        }
 
-    threadWriters.set(threadSegment, writer);
-    return writer;
-  });
+        threadWriters.set(threadSegment, writer);
+        return writer;
+      }).pipe(Effect.withSpan("resolveThreadWriter")),
+    );
 
   const write = Effect.fn("write")(function* (event: unknown, threadId: ThreadId | null) {
     const threadSegment = resolveThreadSegment(threadId);
